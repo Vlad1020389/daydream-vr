@@ -37,10 +37,9 @@ jobs:
       - name: Build Android BLE Plugin (AAR)
         run: |
           cd android_plugin
-          chmod +x gradlew || true
-          gradle assembleRelease || ./gradlew assembleRelease
+          gradle assembleRelease
           mkdir -p ../addons/daydream_ble/bin/release
-          cp app/build/outputs/aar/*release*.aar ../addons/daydream_ble/bin/release/daydream_ble-release.aar
+          cp build/outputs/aar/*release*.aar ../addons/daydream_ble/bin/release/daydream_ble-release.aar
 
       - name: Configure Godot Android SDK Path
         run: |
