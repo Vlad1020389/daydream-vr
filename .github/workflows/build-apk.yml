@@ -2,7 +2,7 @@ name: Build APK
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, master ]
   workflow_dispatch:
 
 permissions:
@@ -24,8 +24,8 @@ jobs:
 
       - name: Install Android SDK parts
         run: |
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0" "ndk;23.2.8568313"
 
       - name: Setup Godot 4.3 & Export Templates
         uses: chickensoft-games/setup-godot@v2
@@ -34,47 +34,55 @@ jobs:
           use-dotnet: false
           include-templates: true
 
-      - name: Build Android BLE Plugin (AAR)
+      - name: Build DaydreamBle plugin (AAR)
         run: |
           cd android_plugin
-          gradle assembleRelease
-          mkdir -p ../addons/daydream_ble/bin/release
-          cp build/outputs/aar/*release*.aar ../addons/daydream_ble/bin/release/daydream_ble-release.aar
+          gradle --no-daemon assembleRelease
+          mkdir -p ../addons/daydream_ble/bin
+          cp build/outputs/aar/*-release.aar ../addons/daydream_ble/bin/daydream_ble.aar
 
-      - name: Install Android Build Template into Project
+      - name: Install Android build template into the project
         run: |
           mkdir -p android/build
           TEMPLATE_ZIP=$(find ~ -name "android_source.zip" | head -n 1)
-          echo "Found template: $TEMPLATE_ZIP"
           unzip -q "$TEMPLATE_ZIP" -d android/build
+          echo -n "4.3.stable" > android/.build_version
           touch android/build/.gdignore
-          echo "4.3.0.stable" > android/.build_version
 
-      - name: Configure Godot Android SDK Path
+      - name: Configure Godot editor settings and debug keystore
         run: |
-          mkdir -p ~/.config/godot
-          cat << 'EOF' > ~/.config/godot/editor_settings-4.3.tres
+          keytool -genkey -v -keystore "$PWD/debug.keystore" -alias androiddebugkey \
+            -storepass android -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          mkdir -p "$HOME/.config/godot"
+          cat > "$HOME/.config/godot/editor_settings-4.3.tres" <<EOF
           [gd_resource type="EditorSettings" format=3]
+
           [resource]
-          export/android/android_sdk_path = "/usr/local/lib/android/sdk"
-          export/android/debug_keystore = ""
-          export/android/debug_keystore_user = "androiddebugkey"
-          export/android/debug_keystore_pass = "android"
+          export/android/android_sdk_path = "$ANDROID_HOME"
+          export/android/java_sdk_path = "$JAVA_HOME"
           EOF
 
-          keytool -genkey -v -keystore ~/.local/share/godot/debug.keystore \
-            -storepass android -alias androiddebugkey -keypass android \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
-          sed -i "s|export/android/debug_keystore = \"\"|export/android/debug_keystore = \"$HOME/.local/share/godot/debug.keystore\"|" ~/.config/godot/editor_settings-4.3.tres
+      - name: Import project resources
+        run: godot --headless --import || true
 
-      - name: Export Android APK
+      - name: Export APK
+        env:
+          GODOT_ANDROID_KEYSTORE_DEBUG_PATH: ${{ github.workspace }}/debug.keystore
+          GODOT_ANDROID_KEYSTORE_DEBUG_USER: androiddebugkey
+          GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD: android
         run: |
           mkdir -p build
-          godot --headless --path . --import
-          godot --headless --path . --export-debug "Android" build/DaydreamVR.apk
+          godot --headless --export-debug "Android" build/DaydreamVR.apk
+          ls -la build
 
-      - name: Publish APK to GitHub Releases
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DaydreamVR-apk
+          path: build/DaydreamVR.apk
+
+      - name: Publish to the "latest" release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
