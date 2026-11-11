@@ -2,256 +2,463 @@ package dev.daydreamble
 
 import android.Manifest
 import android.annotation.SuppressLint
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
-import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
-import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothProfile
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
+import android.app.Activity
+import android.bluetooth.*
+import android.bluetooth.le.*
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
 import org.godotengine.godot.Godot
 import org.godotengine.godot.plugin.GodotPlugin
 import org.godotengine.godot.plugin.SignalInfo
 import org.godotengine.godot.plugin.UsedByGodot
 import java.util.UUID
+import java.util.concurrent.ConcurrentLinkedQueue
 
-/**
- * Мост BLE между контроллером Google Daydream и Godot.
- *
- * Сигналы для GDScript:
- *   controller_packet(hex: String)  — 20 байт пакета в hex-виде
- *   controller_status(text: String) — человекочитаемый статус
- *   controller_state(connected: bool) — состояние GATT-соединения
- */
-@SuppressLint("MissingPermission")
 class DaydreamBlePlugin(godot: Godot) : GodotPlugin(godot) {
 
     companion object {
-        private val SERVICE_UUID: UUID = UUID.fromString("0000fe55-0000-1000-8000-00805f9b34fb")
-        private val DATA_CHAR_UUID: UUID = UUID.fromString("00000001-1000-1000-8000-00805f9b34fb")
-        private val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
-        private const val REQ_PERMISSIONS = 7042
-        private const val SCAN_TIMEOUT_MS = 15_000L
+        private const val TAG = "DaydreamBlePro"
+        private const val REQ_PERMISSIONS = 4012
+
+        val SERVICE_UUID: UUID = UUID.fromString("0000fe55-0000-1000-8000-00805f9b34fb")
+        val DATA_CHAR_UUID: UUID = UUID.fromString("00000001-1000-1000-8000-00805f9b34fb")
+        val CONTROL_CHAR_UUID: UUID = UUID.fromString("00000002-1000-1000-8000-00805f9b34fb")
+        val BATTERY_CHAR_UUID: UUID = UUID.fromString("00000003-1000-1000-8000-00805f9b34fb")
+        val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private var adapter: BluetoothAdapter? = null
+    private var bluetoothManager: BluetoothManager? = null
+    private var bluetoothAdapter: BluetoothAdapter? = null
+    private var scanner: BluetoothLeScanner? = null
     private var gatt: BluetoothGatt? = null
-    private var scanning = false
-    private var connecting = false
+
+    @Volatile private var scanning = false
+    @Volatile private var connecting = false
+    @Volatile private var connected = false
+    @Volatile private var lastPacket = ByteArray(0)
+    @Volatile private var statusText = "Ожидание запуска..."
+    @Volatile private var batteryLevel = -1
+
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val gattQueue = ConcurrentLinkedQueue<Runnable>()
+    @Volatile private var isExecutingGattOp = false
+
+    private val scanRestartRunnable = Runnable {
+        if (!connected && !connecting) {
+            Log.i(TAG, "Перезапуск цикла BLE-сканирования...")
+            stop_scan()
+            mainHandler.postDelayed({ start_scan() }, 300)
+        }
+    }
 
     override fun getPluginName(): String = "DaydreamBle"
 
-    override fun getPluginSignals(): MutableSet<SignalInfo> = mutableSetOf(
-        SignalInfo("controller_packet", String::class.java),
-        SignalInfo("controller_status", String::class.java),
-        SignalInfo("controller_state", Boolean::class.javaObjectType),
+    override fun getPluginSignals(): Set<SignalInfo> = setOf(
+        SignalInfo("status_changed", String::class.java),
+        SignalInfo("connection_changed", Boolean::class.javaObjectType),
+        SignalInfo("packet_received", ByteArray::class.java)
     )
 
-    // ------------------------------------------------------------ API для Godot
+    override fun onMainCreate(activity: Activity?): android.view.View? {
+        initBluetooth(activity)
+        return null
+    }
 
-    @UsedByGodot
-    fun requestPermissionsAndScan() {
-        val act = activity ?: return
-        val missing = requiredPermissions().filter {
-            act.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
+    private fun initBluetooth(act: Activity?) {
+        if (act == null) return
+        if (bluetoothManager == null) {
+            bluetoothManager = act.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
         }
-        if (missing.isEmpty()) {
-            startScan()
-        } else {
-            status("Запрашиваю разрешения Bluetooth…")
-            act.requestPermissions(missing.toTypedArray(), REQ_PERMISSIONS)
+        bluetoothAdapter = bluetoothManager?.adapter
+        scanner = bluetoothAdapter?.bluetoothLeScanner
+    }
+
+    private fun setStatus(text: String) {
+        statusText = text
+        Log.i(TAG, text)
+        mainHandler.post {
+            emitSignal("status_changed", text)
         }
     }
 
-    @UsedByGodot
-    fun startScan() {
-        if (scanning || connecting || gatt != null) return
+    private fun setConnected(value: Boolean) {
+        if (connected == value) return
+        connected = value
+        mainHandler.post {
+            emitSignal("connection_changed", value)
+        }
+    }
+
+    private fun hasPermissions(): Boolean {
+        val act = activity ?: return false
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            ContextCompat.checkSelfPermission(act, Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED &&
+            ContextCompat.checkSelfPermission(act, Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+        } else {
+            ContextCompat.checkSelfPermission(act, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun requestPermissionsIfNeeded() {
         val act = activity ?: return
-        if (requiredPermissions().any { act.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }) {
-            status("Нет разрешений Bluetooth")
+        val perms = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            arrayOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.ACCESS_FINE_LOCATION
+            )
+        } else {
+            arrayOf(
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION
+            )
+        }
+        ActivityCompat.requestPermissions(act, perms, REQ_PERMISSIONS)
+    }
+
+    @UsedByGodot
+    fun is_connected(): Boolean = connected
+
+    @UsedByGodot
+    fun is_scanning(): Boolean = scanning
+
+    @UsedByGodot
+    fun get_status(): String = statusText
+
+    @UsedByGodot
+    fun get_last_packet(): ByteArray = lastPacket
+
+    @UsedByGodot
+    fun get_battery(): Int = batteryLevel
+
+    @SuppressLint("MissingPermission")
+    @UsedByGodot
+    fun start_scan() {
+        val act = activity ?: return
+        initBluetooth(act)
+
+        if (bluetoothAdapter == null) {
+            setStatus("Ошибка: Bluetooth не найден")
             return
         }
-        val mgr = act.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
-        adapter = mgr?.adapter
-        val ad = adapter
-        if (ad == null || !ad.isEnabled) {
-            status("Bluetooth выключен — включите его")
+
+        if (!hasPermissions()) {
+            setStatus("Разрешите доступ к Bluetooth и Геолокации!")
+            requestPermissionsIfNeeded()
+            mainHandler.postDelayed({ start_scan() }, 2000)
             return
         }
-        val scanner = ad.bluetoothLeScanner
+
+        if (bluetoothAdapter?.isEnabled != true) {
+            setStatus("Включите Bluetooth в шторке телефона!")
+            mainHandler.postDelayed({ start_scan() }, 2500)
+            return
+        }
+
+        if (connected) {
+            setStatus("Пульт Daydream подключен!")
+            return
+        }
+
+        if (connecting) return
+
+        // Шаг 1: Ищем среди уже подключенных GATT-устройств
+        try {
+            val connectedDevices = bluetoothManager?.getConnectedDevices(BluetoothProfile.GATT) ?: emptyList()
+            for (dev in connectedDevices) {
+                if (isLikelyDaydream(dev.name, null)) {
+                    setStatus("Найден активный пульт: ${dev.name ?: dev.address}")
+                    connectToDevice(dev)
+                    return
+                }
+            }
+
+            // Шаг 2: Ищем среди сопряженных устройств в памяти телефона
+            val bondedDevices = bluetoothAdapter?.bondedDevices ?: emptySet()
+            for (dev in bondedDevices) {
+                if (isLikelyDaydream(dev.name, null)) {
+                    setStatus("Подключение к известному пульту: ${dev.name ?: dev.address}")
+                    connectToDevice(dev)
+                    return
+                }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Ошибка проверки кэша устройств: ${e.message}")
+        }
+
+        if (scanning) return
+
+        scanner = bluetoothAdapter?.bluetoothLeScanner
         if (scanner == null) {
-            status("BLE-сканер недоступен")
+            setStatus("Ошибка: BLE-сканер занят или недоступен")
             return
         }
+
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
-        scanning = true
-        status("Ищу контроллер Daydream… (нажмите Home на контроллере)")
-        scanner.startScan(null, settings, scanCallback)
-        mainHandler.postDelayed({ if (scanning) stopScan("Контроллер не найден") }, SCAN_TIMEOUT_MS)
-    }
 
-    @UsedByGodot
-    fun stopScan() = stopScan(null)
-
-    @UsedByGodot
-    fun disconnectController() {
-        gatt?.disconnect()
-    }
-
-    // ---------------------------------------------------------------- внутреннее
-
-    private fun requiredPermissions(): List<String> =
-        if (Build.VERSION.SDK_INT >= 31) {
-            listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
-        } else {
-            listOf(Manifest.permission.ACCESS_FINE_LOCATION)
-        }
-
-    private fun status(text: String) = emitSignal("controller_status", text)
-
-    private fun stopScan(message: String?) {
-        if (scanning) {
-            try {
-                adapter?.bluetoothLeScanner?.stopScan(scanCallback)
-            } catch (_: Exception) {
-            }
+        try {
+            scanner?.startScan(null, settings, scanCallback)
+            scanning = true
+            setStatus("Поиск пульта... Нажмите любую кнопку на пульте")
+            mainHandler.removeCallbacks(scanRestartRunnable)
+            mainHandler.postDelayed(scanRestartRunnable, 12000)
+        } catch (e: Exception) {
             scanning = false
-        }
-        if (message != null) status(message)
-    }
-
-    override fun onMainRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<String>,
-        grantResults: IntArray,
-    ) {
-        super.onMainRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode != REQ_PERMISSIONS) return
-        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
-            startScan()
-        } else {
-            status("Разрешения Bluetooth не выданы")
+            setStatus("Сбой запуска поиска: ${e.message}")
         }
     }
 
-    private fun looksLikeDaydream(result: ScanResult): Boolean {
-        val name = result.device.name ?: result.scanRecord?.deviceName ?: ""
-        if (name.contains("daydream", ignoreCase = true)) return true
-        val uuids = result.scanRecord?.serviceUuids
-        return uuids?.any { it.uuid == SERVICE_UUID } == true
+    @SuppressLint("MissingPermission")
+    @UsedByGodot
+    fun stop_scan() {
+        mainHandler.removeCallbacks(scanRestartRunnable)
+        if (!scanning) return
+        try {
+            scanner?.stopScan(scanCallback)
+        } catch (_: Exception) {}
+        scanning = false
+    }
+
+    @SuppressLint("MissingPermission")
+    @UsedByGodot
+    fun disconnect() {
+        stop_scan()
+        connecting = false
+        gattQueue.clear()
+        isExecutingGattOp = false
+        try {
+            gatt?.disconnect()
+            gatt?.close()
+        } catch (_: Exception) {}
+        gatt = null
+        setConnected(false)
+        setStatus("Отключено")
+    }
+
+    private fun isLikelyDaydream(name: String?, record: ScanRecord?): Boolean {
+        val devName = name ?: ""
+        val recName = record?.deviceName ?: ""
+        val combined = "$devName $recName".lowercase()
+
+        if (combined.contains("daydream") || combined.contains("g010") || combined.contains("g011")) {
+            return true
+        }
+
+        val uuids = record?.serviceUuids ?: emptyList()
+        for (parcelUuid in uuids) {
+            val u = parcelUuid.uuid.toString().lowercase()
+            if (parcelUuid.uuid == SERVICE_UUID || u.startsWith("0000fe55") || u.contains("fe55")) {
+                return true
+            }
+        }
+
+        val serviceData = record?.serviceData
+        if (serviceData != null) {
+            for (key in serviceData.keys) {
+                val u = key.uuid.toString().lowercase()
+                if (u.startsWith("0000fe55") || u.contains("fe55")) {
+                    return true
+                }
+            }
+        }
+        return false
     }
 
     private val scanCallback = object : ScanCallback() {
+        @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
-            if (!scanning || connecting || !looksLikeDaydream(result)) return
-            stopScan(null)
-            connecting = true
-            status("Найден контроллер, подключаюсь…")
-            val act = activity ?: return
-            gatt = result.device.connectGatt(act, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            if (connected || connecting) return
+            val device = result.device ?: return
+            val devName = try { device.name } catch (_: Exception) { null }
+
+            if (isLikelyDaydream(devName, result.scanRecord)) {
+                val label = result.scanRecord?.deviceName ?: devName ?: device.address
+                setStatus("Найден пульт ($label)! Соединение...")
+                stop_scan()
+                connectToDevice(device)
+            }
         }
 
         override fun onScanFailed(errorCode: Int) {
-            scanning = false
-            status("Ошибка сканирования BLE: $errorCode")
-        }
-    }
-
-    private fun cleanup() {
-        try {
-            gatt?.close()
-        } catch (_: Exception) {
-        }
-        gatt = null
-        connecting = false
-        emitSignal("controller_state", false)
-    }
-
-    private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(g: BluetoothGatt, st: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                status("Соединение установлено, ищу сервисы…")
-                mainHandler.post { g.discoverServices() }
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                status("Контроллер отключился")
-                cleanup()
-            }
-        }
-
-        override fun onServicesDiscovered(g: BluetoothGatt, st: Int) {
-            val service = g.getService(SERVICE_UUID)
-            val ch = service?.getCharacteristic(DATA_CHAR_UUID)
-            if (ch == null) {
-                status("Не найден сервис данных Daydream (FE55)")
-                g.disconnect()
-                return
-            }
-            g.setCharacteristicNotification(ch, true)
-            val cccd = ch.getDescriptor(CCCD_UUID)
-            if (cccd == null) {
-                status("Нет дескриптора уведомлений")
-                g.disconnect()
-                return
-            }
-            if (Build.VERSION.SDK_INT >= 33) {
-                g.writeDescriptor(cccd, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-            } else {
-                @Suppress("DEPRECATION")
-                cccd.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                @Suppress("DEPRECATION")
-                g.writeDescriptor(cccd)
-            }
-        }
-
-        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, st: Int) {
-            if (st == BluetoothGatt.GATT_SUCCESS) {
-                status("Уведомления включены, жду данные…")
-                emitSignal("controller_state", true)
-            } else {
-                status("Не удалось включить уведомления: $st")
-            }
-        }
-
-        // API 33+
-        override fun onCharacteristicChanged(
-            g: BluetoothGatt,
-            ch: BluetoothGattCharacteristic,
-            value: ByteArray,
-        ) {
-            handlePacket(ch, value)
-        }
-
-        // API < 33
-        @Deprecated("Deprecated in Java")
-        override fun onCharacteristicChanged(g: BluetoothGatt, ch: BluetoothGattCharacteristic) {
-            @Suppress("DEPRECATION")
-            handlePacket(ch, ch.value ?: return)
-        }
-    }
-
-    private fun handlePacket(ch: BluetoothGattCharacteristic, value: ByteArray) {
-        if (ch.uuid != DATA_CHAR_UUID || value.size < 20) return
-        val sb = StringBuilder(value.size * 2)
-        for (b in value) sb.append(String.format("%02x", b))
-        emitSignal("controller_packet", sb.toString())
-    }
-
-    override fun onMainDestroy() {
-        stopScan(null)
-        gatt?.disconnect()
-        cleanup()
-        super.onMainDestroy()
-    }
+scanning = false
+setStatus("Ошибка BLE ($errorCode). Включите GPS/Местоположение!")
+mainHandler.postDelayed({ start_scan() }, 3000)
+}
+}
+@SuppressLint("MissingPermission")
+private fun connectToDevice(device: BluetoothDevice) {
+if (connecting || connected) return
+connecting = true
+gattQueue.clear()
+isExecutingGattOp = false
+try {
+gatt?.close()
+} catch (_: Exception) {}
+mainHandler.post {
+gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+device.connectGatt(activity, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+} else {
+device.connectGatt(activity, false, gattCallback)
+}
+}
+}
+private fun enqueueGattOp(op: Runnable) {
+gattQueue.add(op)
+processNextGattOp()
+}
+private fun processNextGattOp() {
+if (isExecutingGattOp) return
+val next = gattQueue.poll() ?: return
+isExecutingGattOp = true
+mainHandler.post(next)
+}
+private fun completeGattOp() {
+isExecutingGattOp = false
+processNextGattOp()
+}
+private val gattCallback = object : BluetoothGattCallback() {
+@SuppressLint("MissingPermission")
+override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
+if (newState == BluetoothProfile.STATE_CONNECTED) {
+connecting = false
+setStatus("Подключено! Настройка датчиков...")
+mainHandler.postDelayed({
+try {
+g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+g.discoverServices()
+} catch (e: Exception) {
+setStatus("Ошибка опроса сервисов: ${e.message}")
+}
+}, 300)
+} else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+connecting = false
+setConnected(false)
+gattQueue.clear()
+isExecutingGattOp = false
+setStatus("Связь потеряна. Переподключение...")
+try { g.close() } catch (_: Exception) {}
+gatt = null
+mainHandler.postDelayed({ start_scan() }, 1200)
+}
+}
+@SuppressLint("MissingPermission")
+override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+if (status != BluetoothGatt.GATT_SUCCESS) {
+setStatus("Ошибка сервисов ($status). Повтор...")
+disconnect()
+mainHandler.postDelayed({ start_scan() }, 1000)
+return
+}
+val service = g.getService(SERVICE_UUID)
+if (service == null) {
+setStatus("Это не пульт Daydream (нет сервиса FE55)")
+disconnect()
+return
+}
+val dataChar = service.getCharacteristic(DATA_CHAR_UUID)
+if (dataChar == null) {
+setStatus("Не найдена характеристика данных пульта")
+disconnect()
+return
+}
+// 1. Включаем поток данных датчиков (гироскоп + кнопки)
+enqueueGattOp(Runnable {
+g.setCharacteristicNotification(dataChar, true)
+val descriptor = dataChar.getDescriptor(CCCD_UUID)
+if (descriptor != null) {
+if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+g.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+} else {
+@Suppress("DEPRECATION")
+descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+@Suppress("DEPRECATION")
+g.writeDescriptor(descriptor)
+}
+} else {
+completeGattOp()
+}
+})
+// 2. Отправляем команду пробуждения на Control-характеристику (если есть)
+val controlChar = service.getCharacteristic(CONTROL_CHAR_UUID)
+if (controlChar != null) {
+enqueueGattOp(Runnable {
+val wakeCmd = byteArrayOf(0x01)
+if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+g.writeCharacteristic(controlChar, wakeCmd, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
+} else {
+@Suppress("DEPRECATION")
+controlChar.value = wakeCmd
+@Suppress("DEPRECATION")
+g.writeCharacteristic(controlChar)
+}
+})
+}
+// 3. Читаем уровень батареи пульта (если доступно)
+val batteryChar = service.getCharacteristic(BATTERY_CHAR_UUID)
+if (batteryChar != null) {
+enqueueGattOp(Runnable {
+g.readCharacteristic(batteryChar)
+})
+}
+setConnected(true)
+setStatus("Контроллер Daydream готов к игре!")
+}
+override fun onDescriptorWrite(g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+completeGattOp()
+}
+override fun onCharacteristicWrite(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+completeGattOp()
+}
+@Deprecated("Deprecated in Java")
+override fun onCharacteristicRead(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+if (characteristic.uuid == BATTERY_CHAR_UUID && status == BluetoothGatt.GATT_SUCCESS) {
+@Suppress("DEPRECATION")
+val v = characteristic.value
+if (v != null && v.isNotEmpty()) {
+batteryLevel = v[0].toInt() and 0xFF
+setStatus("Daydream подключен! Заряд: $batteryLevel%")
+}
+}
+completeGattOp()
+}
+override fun onCharacteristicRead(
+g: BluetoothGatt,
+characteristic: BluetoothGattCharacteristic,
+value: ByteArray,
+status: Int
+) {
+if (characteristic.uuid == BATTERY_CHAR_UUID && status == BluetoothGatt.GATT_SUCCESS && value.isNotEmpty()) {
+batteryLevel = value[0].toInt() and 0xFF
+setStatus("Daydream подключен! Заряд: $batteryLevel%")
+}
+completeGattOp()
+}
+@Deprecated("Deprecated in Java")
+override fun onCharacteristicChanged(g: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+if (characteristic.uuid == DATA_CHAR_UUID) {
+@Suppress("DEPRECATION")
+val data = characteristic.value ?: return
+lastPacket = data
+emitSignal("packet_received", data)
+}
+}
+override fun onCharacteristicChanged(
+g: BluetoothGatt,
+characteristic: BluetoothGattCharacteristic,
+value: ByteArray
+) {
+if (characteristic.uuid == DATA_CHAR_UUID) {
+lastPacket = value
+emitSignal("packet_received", value)
+}
+}
+}
 }
