@@ -27,20 +27,12 @@ jobs:
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
           $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
-      - name: Download Godot 4.3 & Export Templates
-        run: |
-          mkdir -p /tmp/godot
-          cd /tmp/godot
-          curl -fSL -o godot.zip "https://godotengine.org"
-          unzip -q godot.zip
-          mv Godot_v4.3-stable_linux.x86_64 /usr/local/bin/godot
-          chmod +x /usr/local/bin/godot
-
-          curl -fSL -o templates.tpz "https://godotengine.org"
-          mkdir -p ~/.local/share/godot/export_templates/4.3.stable
-          unzip -q templates.tpz -d /tmp/godot/tpl
-          mv /tmp/godot/tpl/templates/* ~/.local/share/godot/export_templates/4.3.stable/
-          rm -rf /tmp/godot
+      - name: Setup Godot 4.3 & Export Templates
+        uses: chickensoft-games/setup-godot@v2
+        with:
+          version: 4.3.0
+          use-dotnet: false
+          include-templates: true
 
       - name: Build Android BLE Plugin (AAR)
         run: |
