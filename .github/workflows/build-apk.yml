@@ -31,14 +31,14 @@ jobs:
         run: |
           mkdir -p /tmp/godot
           cd /tmp/godot
-          wget -q https://github.com
-          unzip -q Godot_v4.3-stable_linux.x86_64.zip
+          curl -fSL -o godot.zip "https://github.com"
+          unzip -q godot.zip
           mv Godot_v4.3-stable_linux.x86_64 /usr/local/bin/godot
           chmod +x /usr/local/bin/godot
 
-          wget -q https://github.com
+          curl -fSL -o templates.tpz "https://github.com"
           mkdir -p ~/.local/share/godot/export_templates/4.3.stable
-          unzip -q Godot_v4.3-stable_export_templates.tpz -d /tmp/godot/tpl
+          unzip -q templates.tpz -d /tmp/godot/tpl
           mv /tmp/godot/tpl/templates/* ~/.local/share/godot/export_templates/4.3.stable/
           rm -rf /tmp/godot
 
