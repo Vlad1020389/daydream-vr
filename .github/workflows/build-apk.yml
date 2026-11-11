@@ -41,6 +41,15 @@ jobs:
           mkdir -p ../addons/daydream_ble/bin/release
           cp build/outputs/aar/*release*.aar ../addons/daydream_ble/bin/release/daydream_ble-release.aar
 
+      - name: Install Android Build Template into Project
+        run: |
+          mkdir -p android/build
+          TEMPLATE_ZIP=$(find ~ -name "android_source.zip" | head -n 1)
+          echo "Found template: $TEMPLATE_ZIP"
+          unzip -q "$TEMPLATE_ZIP" -d android/build
+          touch android/build/.gdignore
+          echo "4.3.0.stable" > android/.build_version
+
       - name: Configure Godot Android SDK Path
         run: |
           mkdir -p ~/.config/godot
